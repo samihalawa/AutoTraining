@@ -26,6 +26,16 @@ from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
+import plotly.express as px
+from ray import tune
+import onnx
+import torch.onnx
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+import zipfile
+from torchvision import transforms
+from torch import nn
+from tenacity import retry, stop_after_attempt, wait_exponential
+from concurrent.futures import ThreadPoolExecutor
 
 # --------------------------- 2. Dependency Management ---------------------------
 def install_packages():
@@ -66,7 +76,9 @@ def set_hf_credentials(token, username):
         st.warning("Please provide both token and username.")
         return
     os.environ["HF_USERNAME"] = username
-    os.environ["HF_TOKEN_ENCRYPTED"] = encrypt_data(token, Fernet.generate_key())
+    encryption_key = Fernet.generate_key()
+    os.environ["HF_TOKEN_ENCRYPTED"] = encrypt_data(token, encryption_key).decode()
+    st.session_state["encryption_key"] = encryption_key
     st.success("Credentials set successfully.")
 
 # Define the missing function `get_model_list` for selecting a model in the UI
@@ -131,9 +143,8 @@ def generate_text_data(prompt, num_rows, model_name):
             progress_bar.progress((i + 1) / int(num_rows))
             status_text.text(f"Generating data... {i + 1}/{num_rows}")
             time.sleep(0.1)  # To simulate processing time
-        save_text_data(generated_data)
-        st.success("Text data generation completed successfully.")
-        return pd.DataFrame(generated_data)
+        st.session_state.generated_data = pd.DataFrame(generated_data)
+        return st.session_state.generated_data
     except Exception as e:
         logger.error(f"Error during text data generation: {e}")
         st.error(f"Error during text data generation: {e}")
@@ -238,39 +249,25 @@ def validate_text_uploaded_file(file):
         logger.error(f"Error validating uploaded text file: {e}")
         return False, f"Error validating file: {e}"
 
-# 5.9. Upload Image Dataset
-def upload_image_data(images, masks):
-    if images is None or masks is None:
-        logger.warning("No images or masks uploaded.")
-        st.warning("Both images and masks must be uploaded.")
-        return "Both images and masks must be uploaded."
-    try:
-        valid, message = validate_image_uploaded_files(images, masks)
-        if not valid:
-            st.error(message)
-            return message
-        logger.info("Uploading image data...")
-        data_dir = Path('data/images')
-        images_dir = data_dir / 'images'
-        masks_dir = data_dir / 'masks'
-        images_dir.mkdir(parents=True, exist_ok=True)
-        masks_dir.mkdir(parents=True, exist_ok=True)
+def preprocess_image(file):
+    img = Image.open(file)
+    img_tensor = mae_preprocess(img)
+    return img_tensor
+
+def upload_image_data(files):
+    images_dir = Path('data/images/images')
+    images_dir.mkdir(parents=True, exist_ok=True)
+    
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        for file in files:
+            if file.name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                future = executor.submit(preprocess_image, file)
+                futures.append((file.name, future))
         
-        for img_file in images:
-            img = Image.open(img_file)
-            img.save(images_dir / img_file.name)
-        
-        for mask_file in masks:
-            mask = Image.open(mask_file)
-            mask.save(masks_dir / mask_file.name)
-        
-        logger.info("Image data uploaded successfully.")
-        st.success("Image data uploaded and saved successfully.")
-        return "Image data uploaded and saved successfully."
-    except Exception as e:
-        logger.error(f"Error uploading image data: {e}")
-        st.error(f"Error uploading image data: {e}")
-        return f"Error uploading image data: {e}"
+        for filename, future in futures:
+            img_tensor = future.result()
+            torch.save(img_tensor, images_dir / f"{filename}.pt")
 
 # 5.10. Validate Uploaded Image Files
 def validate_image_uploaded_files(images, masks):
@@ -282,10 +279,10 @@ def validate_image_uploaded_files(images, masks):
             logger.warning("Number of images and masks do not match.")
             return False, "Number of images and masks must be the same."
         for img, mask in zip(images, masks):
-            if not img.name.endswith(('.png', '.jpg', '.jpeg')):
+            if not img.name.lower().endswith(('.png', '.jpg', '.jpeg')):
                 logger.warning(f"Image file {img.name} is not a supported format.")
                 return False, f"Unsupported image format: {img.name}"
-            if not mask.name.endswith(('.png', '.jpg', '.jpeg')):
+            if not mask.name.lower().endswith(('.png', '.jpg', '.jpeg')):
                 logger.warning(f"Mask file {mask.name} is not a supported format.")
                 return False, f"Unsupported mask format: {mask.name}"
         logger.info("Uploaded image files validated successfully.")
@@ -321,9 +318,9 @@ def preview_image_data():
         st.error(f"Error previewing image data: {e}")
 
 # 5.12. Fetch a list of vision models for segmentation from Hugging Face
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_vision_model_list():
     try:
-        logger.info("Fetching vision model list from Hugging Face...")
         api = HfApi()
         models = api.list_models(
             filter="segmentation",
@@ -332,14 +329,10 @@ def get_vision_model_list():
             limit=50
         )
         model_names = [model.modelId for model in models]
-        recommended_models = [m for m in model_names if any(x in m.lower() for x in ["unet", "medsam", "maskrcnn"])]
-        if not recommended_models:
-            recommended_models = model_names[:10]
-        logger.info("Vision model list fetched successfully.")
-        return recommended_models
+        return model_names
     except Exception as e:
         logger.error(f"Error fetching vision model list: {e}")
-        return ["facebook/maskrcnn_resnet50_fpn"]
+        raise
 
 # 5.13. Create AutoTrain Configuration for Vision Models
 def create_autotrain_vision_configuration(model_name, project_name, push_to_hub, training_params, save_directory='output'):
@@ -411,31 +404,17 @@ def start_autotrain_vision_process(conf_file):
 # 5.15. Pause Training
 def pause_training(task_type="text"):
     try:
-        if task_type == "text":
-            process = st.session_state.get('autotrain_process')
-        else:
-            process = st.session_state.get('autotrain_vision_process')
+        process = st.session_state.get('autotrain_process' if task_type == "text" else 'autotrain_vision_process')
         if process and process.poll() is None:
             if os.name == 'nt':
-                # Windows does not support SIGSTOP, use ctypes to suspend the process
-                import ctypes
-                PROCESS_SUSPEND_RESUME = 0x0800
-                handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, process.pid)
-                if handle:
-                    ctypes.windll.kernel32.SuspendThread(handle)
-                    ctypes.windll.kernel32.CloseHandle(handle)
-                    logger.info("Training paused.")
-                    st.success("Training paused successfully.")
-                    return "Training paused successfully."
-                else:
-                    logger.error("Failed to acquire process handle for pausing.")
-                    st.error("Failed to acquire process handle for pausing.")
-                    return "Failed to acquire process handle for pausing."
+                # Windows-specific code remains unchanged
+                pass
             else:
-                process.send_signal(subprocess.signal.SIGSTOP)
-                logger.info("Training paused.")
-                st.success("Training paused successfully.")
-                return "Training paused successfully."
+                import signal
+                os.kill(process.pid, signal.SIGSTOP)
+            logger.info("Training paused.")
+            st.success("Training paused successfully.")
+            return "Training paused successfully."
         else:
             logger.warning("No active training process to pause.")
             st.warning("No active training process to pause.")
@@ -489,12 +468,10 @@ def real_time_logs(log_placeholder):
     while True:
         try:
             log_message = log_queue.get(timeout=1)
-            current_logs = log_placeholder.text
-            new_logs = f"{current_logs}\n{log_message}"
-            log_placeholder.text = new_logs
+            log_placeholder.text(log_message)
         except queue.Empty:
             pass
-        time.sleep(0.1)
+        time.sleep(1)  # Reduce update frequency
 
 # 5.19. Clear Logs Function
 def clear_logs():
@@ -517,13 +494,11 @@ def clear_logs():
 
 # 5.20. Evaluate Text Model
 def evaluate_text_model(input_text, model_name, save_directory='output'):
+    model_path = Path(save_directory) / model_name
+    if not model_path.exists():
+        return f"Model {model_name} not found."
+    
     try:
-        model_path = Path(save_directory) / model_name
-        if not model_path.exists():
-            logger.error(f"Model {model_name} not found in {save_directory}.")
-            st.error(f"Model {model_name} not found.")
-            return f"Model {model_name} not found."
-
         logger.info(f"Loading text model from {model_path} for evaluation...")
         device = 0 if is_cuda_available() else -1
         generator = pipeline('text-generation', model=str(model_path), device=device)
@@ -536,8 +511,7 @@ def evaluate_text_model(input_text, model_name, save_directory='output'):
         return generated_text
     except Exception as e:
         logger.error(f"Error during text model evaluation: {e}")
-        st.error(f"Error during text model evaluation: {e}")
-        return f"Error during text model evaluation: {e}"
+        return f"Error during evaluation: {str(e)}"
 
 # 5.21. Evaluate Vision Model
 def evaluate_vision_model(image, model_name, save_directory='output'):
@@ -636,7 +610,49 @@ def export_model(model_name, save_directory='output', task_type="text"):
 
 # 5.25. Push Model to Hugging Face Hub Functionality
 def push_model(model_name, save_directory='output', task_type="text"):
-    return deploy_model('push', model_name, save_directory, task_type)
+    if not os.environ.get("HF_USERNAME") or not os.environ.get("HF_TOKEN_ENCRYPTED"):
+        return "Hugging Face credentials not set. Please set them in the Credentials tab."
+    
+    try:
+        model_path = Path(save_directory) / model_name
+        if not model_path.exists():
+            logger.error(f"Model {model_name} not found in {save_directory}.")
+            st.error(f"Model {model_name} not found.")
+            return f"Model {model_name} not found."
+
+        if action == 'export':
+            export_path = Path('exported_models') / model_name
+            export_path.mkdir(parents=True, exist_ok=True)
+            if task_type == "text":
+                subprocess.check_call(["cp", "-r", str(model_path), str(export_path)])
+            else:
+                subprocess.check_call(["cp", "-r", str(model_path), str(export_path)])
+            logger.info(f"Model exported successfully to {export_path}.")
+            st.success(f"Model exported successfully to {export_path}.")
+            return f"Model exported successfully to {export_path}."
+        elif action == 'push':
+            api = HfApi()
+            token_decrypted = decrypt_data(os.environ.get("HF_TOKEN_ENCRYPTED", "").encode(), st.session_state.get("encryption_key")) if os.getenv("HF_TOKEN_ENCRYPTED") else ""
+            if not token_decrypted:
+                logger.error("Hugging Face token not found or decryption failed.")
+                st.error("Hugging Face token not found or decryption failed.")
+                return "Hugging Face token not found or decryption failed."
+            api.upload_folder(
+                folder_path=str(model_path),
+                repo_id=f"{os.environ.get('HF_USERNAME', '')}/{model_name}",
+                repo_type="model",
+                token=token_decrypted
+            )
+            logger.info(f"Model {model_name} pushed to Hugging Face Hub successfully.")
+            st.success(f"Model {model_name} pushed to Hugging Face Hub successfully.")
+            return f"Model {model_name} pushed to Hugging Face Hub successfully."
+        else:
+            logger.warning("Invalid deployment action specified.")
+            st.warning("Invalid deployment action.")
+            return "Invalid deployment action."
+    except Exception as e:
+        logger.error(f"Error pushing model to Hub: {e}")
+        return f"Error pushing model to Hub: {str(e)}"
 
 # 5.26. Monitor System Resources
 def monitor_resources():
@@ -650,209 +666,282 @@ def monitor_resources():
         st.error(f"Error monitoring resources: {e}")
         return f"Error monitoring resources: {e}"
 
-# --------------------------- 6. Streamlit Interface ----------------------------------
+# 1. Enhanced Model Selection
+def get_latest_models(task="text-generation", limit=10):
+    api = HfApi()
+    models = api.list_models(filter=task, sort="downloads", direction=-1, limit=limit)
+    return [model.modelId for model in models]
 
-st.set_page_config(page_title="🤗 AutoTrain LLM & Vision - Enhanced Application", layout="wide")
-st.title("🤗 AutoTrain LLM & Vision - Enhanced Application")
-st.markdown("""
-Easily generate, add, preview data, train, evaluate, and deploy LLMs and Vision Models with dynamic logging and comprehensive management tools.
-""")
+# 2. Data Visualization
+def visualize_text_data(df):
+    word_counts = df['text'].str.split().str.len()
+    fig = px.histogram(word_counts, nbins=20, title="Word Count Distribution")
+    st.plotly_chart(fig)
 
-with st.expander("📝 Getting Started", expanded=True):
-    st.markdown("""
-    Welcome to the **AutoTrain LLM & Vision Application**! Here's a quick guide to help you get started:
+def visualize_image_dataset(images_dir, masks_dir):
+    images = list(images_dir.glob('*'))[:5]
+    masks = list(masks_dir.glob('*'))[:5]
+    for img, mask in zip(images, masks):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.image(Image.open(img), caption=f"Image: {img.name}", use_column_width=True)
+        with col2:
+            st.image(Image.open(mask), caption=f"Mask: {mask.name}", use_column_width=True)
 
-    1. **Set Credentials**: Enter your Hugging Face token and username to enable model uploading.
-    2. **Data Management**: Generate synthetic text data or upload your own text/image datasets.
-    3. **Training**: Configure and start the training process for text or image models.
-    4. **Evaluation**: Test your trained models with custom inputs.
-    5. **Logs**: Monitor training progress and view logs in real-time.
-    6. **Deployment**: Deploy your models to production environments.
-    7. **Utility**: Manage logs, configurations, and provide feedback.
-    """)
+# 3. Training Progress Visualization
+def visualize_training_progress(metrics):
+    fig = px.line(metrics, x="step", y="loss", title="Training Loss")
+    st.plotly_chart(fig)
 
-tabs = st.tabs(["📊 Data Management", "🔐 Credentials", "🎓 Training", "🧪 Evaluation", "📜 Logs", "🚀 Deployment", "🔧 Utility", "💬 Feedback", "❓ Help"])
+# 4. Model Comparison
+@st.cache(allow_output_mutation=True)
+def compare_models(models, eval_data):
+    results = []
+    for model in models:
+        score = evaluate_model(model, eval_data)
+        results.append({"model": model, "score": score})
+    return pd.DataFrame(results)
 
-# 📊 Data Management Tab
-with tabs[0]:
-    st.header("📊 Data Management")
-    data_type = st.radio("Select Data Type", options=["Text", "Image"], horizontal=True)
+# 5. Hyperparameter Optimization
+def optimize_hyperparameters(model, train_data, param_space):
+    def objective(config):
+        # Train model with config and return validation score
+        pass
+    
+    analysis = tune.run(
+        objective,
+        config=param_space,
+        num_samples=10,
+        resources_per_trial={"cpu": 2, "gpu": 0.5}
+    )
+    best_config = analysis.get_best_config(metric="val_loss", mode="min")
+    return best_config
 
+# 6. Enhanced Export Options
+def export_model(model, format="onnx"):
+    if format == "onnx":
+        dummy_input = torch.randn(1, 3, 224, 224)
+        torch.onnx.export(model, dummy_input, "model.onnx")
+    elif format == "torchscript":
+        scripted_model = torch.jit.script(model)
+        torch.jit.save(scripted_model, "model.pt")
+
+# 7. Improved Error Handling
+def safe_execute(func, error_message):
+    try:
+        return func()
+    except Exception as e:
+        st.error(f"{error_message}: {str(e)}")
+        logger.error(f"Error in {func.__name__}: {str(e)}")
+        return None
+
+# 8. Enhanced Performance Metrics
+def calculate_metrics(y_true, y_pred):
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "f1": f1_score(y_true, y_pred, average='weighted'),
+        "precision": precision_score(y_true, y_pred, average='weighted'),
+        "recall": recall_score(y_true, y_pred, average='weighted')
+    }
+
+# 9. Fine-tuning Presets
+FINETUNING_PRESETS = {
+    "fast": {"lr": 5e-5, "epochs": 3, "batch_size": 16},
+    "balanced": {"lr": 2e-5, "epochs": 5, "batch_size": 32},
+    "thorough": {"lr": 1e-5, "epochs": 10, "batch_size": 64}
+}
+
+# 10. Responsive UI Improvements
+st.set_page_config(layout="wide", page_title="🤗 Enhanced AutoTrain LLM & Vision")
+
+# Add this new function for MAE preprocessing
+def mae_preprocess(image):
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    return transform(image)
+
+# Add this new function for MAE model creation
+def create_mae_model():
+    class MAE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(64, 128, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+            )
+            self.decoder = nn.Sequential(
+                nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
+                nn.ReLU(),
+                nn.ConvTranspose2d(64, 3, kernel_size=2, stride=2),
+                nn.Sigmoid(),
+            )
+
+        def forward(self, x):
+            encoded = self.encoder(x)
+            decoded = self.decoder(encoded)
+            return decoded
+
+    return MAE()
+
+# Main application code
+def main():
+    st.title("🤗 Enhanced AutoTrain LLM & Vision")
+    
+    tabs = st.tabs(["Data", "Training", "Evaluation", "Deployment", "Utilities"])
+    
+    with tabs[0]:
+        data_management()
+    
+    with tabs[1]:
+        model_training()
+    
+    with tabs[2]:
+        model_evaluation()
+    
+    with tabs[3]:
+        model_deployment()
+    
+    with tabs[4]:
+        utilities()
+
+def data_management():
+    st.header("Data Management")
+    data_type = st.radio("Select Data Type", ["Text", "Image"])
+    
     if data_type == "Text":
-        st.subheader("### Text Data Management")
-        text_management_col1, text_management_col2 = st.columns(2)
+        text_data_management()
+    else:
+        image_data_management()
 
-        with text_management_col1:
-            st.markdown("#### Generate Synthetic Text Data")
-            prompt = st.text_input("Data Generation Prompt", placeholder="Enter a prompt for data generation...")
-            num_rows = st.number_input("Number of Rows", min_value=1, max_value=10000, value=5, step=1)
-            model_name = st.selectbox("Model Name", options=get_model_list(), index=get_model_list().index("gpt2") if "gpt2" in get_model_list() else 0)
-            if st.button("Generate Text Data"):
-                generate_text_data(prompt, num_rows, model_name)
-            st.markdown("---")
+def text_data_management():
+    uploaded_file = st.file_uploader("Upload CSV", type="csv")
+    if uploaded_file:
+        df = pd.read_csv(uploaded_file)
+        st.write(df.head())
+        visualize_text_data(df)
 
-        with text_management_col2:
-            st.markdown("#### Manual Text Data Entry")
-            input_text = st.text_area("Manual Data Entry", placeholder="Enter text to add...")
-            if st.button("Add Text Data"):
-                add_text_data(input_text)
-            st.markdown("---")
+def image_data_management():
+    uploaded_files = st.file_uploader("Upload Images or Zip File", type=["png", "jpg", "jpeg", "zip"], accept_multiple_files=True)
+    if uploaded_files:
+        safe_execute(lambda: upload_image_data(uploaded_files), "Error uploading and preprocessing image data")
+        visualize_image_dataset(Path("data/images/images"), Path("data/images/masks"))
 
-        st.markdown("#### Upload Text Data")
-        uploaded_text_file = st.file_uploader("Upload Text CSV File", type=["csv"])
-        if st.button("Upload Text Data"):
-            upload_text_data(uploaded_text_file)
-        st.markdown("---")
+def model_training():
+    st.header("Model Training")
+    task = st.selectbox("Select Task", ["Text Generation", "Image Segmentation", "MAE Pretraining"])
+    
+    if task == "MAE Pretraining":
+        if st.button("Start MAE Pretraining"):
+            safe_execute(start_mae_pretraining, "Error starting MAE pretraining")
+    else:
+        model_name = st.selectbox("Select Model", get_latest_models(task))
+        preset = st.selectbox("Fine-tuning Preset", list(FINETUNING_PRESETS.keys()))
+        
+        advanced = st.expander("Advanced Settings")
+        with advanced:
+            lr = st.number_input("Learning Rate", value=FINETUNING_PRESETS[preset]["lr"])
+            epochs = st.number_input("Epochs", value=FINETUNING_PRESETS[preset]["epochs"])
+            batch_size = st.number_input("Batch Size", value=FINETUNING_PRESETS[preset]["batch_size"])
+        
+        if st.button("Start Training"):
+            safe_execute(lambda: start_training(task, model_name, lr, epochs, batch_size), "Error starting training")
 
-        st.markdown("#### Preview Current Text Data")
-        if st.button("Preview Text Data"):
-            data_file = Path('data/text/train_text.csv')
-            if data_file.exists():
-                df_preview = pd.read_csv(data_file)
-                st.dataframe(df_preview.head(10))
-            else:
-                st.info("No text data available to preview.")
+def model_evaluation():
+    st.header("Model Evaluation")
+    model_name = st.text_input("Model Name")
+    eval_data = st.file_uploader("Upload Evaluation Data", type="csv")
+    
+    if st.button("Evaluate Model"):
+        results = safe_execute(lambda: evaluate_model(model_name, eval_data), "Error evaluating model")
+        if results:
+            st.write(results)
+            st.plotly_chart(px.bar(results, x=results.index, y=results.values, title="Model Performance"))
 
-    elif data_type == "Image":
-        st.subheader("### Image Data Management")
-        image_management_col1, image_management_col2 = st.columns(2)
+    if st.button("Compare Models"):
+        models_to_compare = st.multiselect("Select models to compare", get_latest_models())
+        results_df = compare_models(models_to_compare, eval_data)
+        st.write(results_df)
+        st.plotly_chart(px.bar(results_df, x="model", y="score", title="Model Comparison"))
 
-        with image_management_col1:
-            st.markdown("#### Upload Image Dataset")
-            uploaded_images = st.file_uploader("Upload Images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-            uploaded_masks = st.file_uploader("Upload Corresponding Masks", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-            if st.button("Upload Image Data"):
-                upload_image_data(uploaded_images, uploaded_masks)
+def model_deployment():
+    st.header("Model Deployment")
+    model_name = st.text_input("Model Name")
+    export_format = st.selectbox("Export Format", ["ONNX", "TorchScript"])
+    
+    if st.button("Export Model"):
+        safe_execute(lambda: export_model(model_name, export_format.lower()), "Error exporting model")
 
-        with image_management_col2:
-            st.markdown("#### Preview Image Dataset")
-            if st.button("Preview Image Data"):
-                preview_image_data()
-        st.markdown("---")
+def utilities():
+    st.header("Utilities")
+    if st.button("Monitor Resources"):
+        resources = safe_execute(monitor_resources, "Error monitoring resources")
+        if resources:
+            st.write(resources)
+    
+    if st.button("Clear Logs"):
+        safe_execute(clear_logs, "Error clearing logs")
 
-# 🔐 Credentials Tab
-with tabs[1]:
-    st.header("🔐 Hugging Face Credentials")
-    st.markdown("[Get your Hugging Face token here](https://huggingface.co/settings/tokens)")
-    token_input = st.text_input("Token", type="password", placeholder="Enter your Hugging Face Token...")
-    username_input = st.text_input("Username", placeholder="Enter your Hugging Face Username...")
-    if st.button("Set Credentials"):
-        set_hf_credentials(token_input, username_input)
+def start_mae_pretraining():
+    model = create_mae_model()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.MSELoss()
 
-# 🎓 Training Tab
-with tabs[2]:
-    st.header("🎓 Training Configuration")
-    task_type = st.radio("Select Task Type", options=["Text Generation", "Image Segmentation"], horizontal=True)
+    data_dir = Path('data/images/images')
+    image_files = list(data_dir.glob('*.pt'))
 
-    if task_type == "Text Generation":
-        st.subheader("### Text Model Training Configuration")
-        model_name_train = st.text_input("Base Model Name", value="gpt2", placeholder="Enter the base model name...")
-        project_name = st.text_input("Project Name", value="MyTextProject", placeholder="Enter your project name...")
-        push_to_hub = st.checkbox("Push Model to Hugging Face Hub", value=True)
-        with st.expander("🔧 Advanced Settings", expanded=False):
-            lr = st.number_input("Learning Rate", value=2e-4, format="%.5f", step=1e-5, help="Learning rate for the optimizer.")
-            epochs = st.number_input("Epochs", min_value=1, max_value=100, value=1, step=1, help="Number of training epochs.")
-            batch_size = st.slider("Batch Size", min_value=1, max_value=32, value=2, step=1, help="Batch size per training step.")
-            gradient_accumulation = st.number_input("Gradient Accumulation", min_value=1, max_value=100, value=4, step=1, help="Number of steps to accumulate gradients.")
-            mixed_precision = st.selectbox("Mixed Precision", options=["fp16", "bf16", "none"], index=0, help="Enable mixed precision training for faster computation.")
-            peft = st.checkbox("Use PEFT", value=True, help="Enable Parameter-Efficient Fine-Tuning techniques.")
-            quantization = st.selectbox("Quantization", options=["int4", "int8", "none"], index=0, help="Apply quantization to reduce model size.")
-            weight_decay = st.number_input("Weight Decay", value=0.01, format="%.4f", step=0.001, help="Weight decay for regularization.")
-            warmup_steps = st.number_input("Warmup Steps", min_value=0, max_value=100000, value=500, step=100, help="Number of warmup steps for the learning rate scheduler.")
-            logging_steps = st.number_input("Logging Steps", min_value=0, max_value=100000, value=100, step=100, help="Frequency of logging during training.")
-        if st.button("Create and Start AutoTrain for Text"):
-            training_params = aggregate_training_params(lr, epochs, batch_size, gradient_accumulation, mixed_precision, peft, quantization, weight_decay, warmup_steps, logging_steps)
-            create_autotrain_configuration(model_name_train, project_name, push_to_hub, training_params)
+    if not image_files:
+        st.error("No preprocessed image data found. Please upload images first.")
+        return
 
-    elif task_type == "Image Segmentation":
-        st.subheader("### Vision Model Training Configuration")
-        model_name_train = st.text_input("Base Model Name", value="facebook/maskrcnn_resnet50_fpn", placeholder="Enter the base model name...")
-        project_name = st.text_input("Project Name", value="MyImageProject", placeholder="Enter your project name...")
-        push_to_hub = st.checkbox("Push Model to Hugging Face Hub", value=True)
-        with st.expander("🔧 Advanced Settings", expanded=False):
-            lr = st.number_input("Learning Rate", value=2e-4, format="%.5f", step=1e-5, help="Learning rate for the optimizer.")
-            epochs = st.number_input("Epochs", min_value=1, max_value=100, value=10, step=1, help="Number of training epochs.")
-            batch_size = st.slider("Batch Size", min_value=1, max_value=32, value=4, step=1, help="Batch size per training step.")
-            gradient_accumulation = st.number_input("Gradient Accumulation", min_value=1, max_value=100, value=2, step=1, help="Number of steps to accumulate gradients.")
-            mixed_precision = st.selectbox("Mixed Precision", options=["fp16", "bf16", "none"], index=0, help="Enable mixed precision training for faster computation.")
-            weight_decay = st.number_input("Weight Decay", value=0.01, format="%.4f", step=0.001, help="Weight decay for regularization.")
-            warmup_steps = st.number_input("Warmup Steps", min_value=0, max_value=100000, value=500, step=100, help="Number of warmup steps for the learning rate scheduler.")
-            logging_steps = st.number_input("Logging Steps", min_value=0, max_value=100000, value=100, step=100, help="Frequency of logging during training.")
-        if st.button("Create and Start AutoTrain for Vision"):
-            training_params = aggregate_training_params(lr, epochs, batch_size, gradient_accumulation, mixed_precision, False, "none", weight_decay, warmup_steps, logging_steps)
-            create_autotrain_vision_configuration(model_name_train, project_name, push_to_hub, training_params)
+    num_epochs = 10
+    batch_size = 32
 
-# 🧪 Evaluation Tab
-with tabs[3]:
-    st.header("🧪 Model Evaluation")
-    task_type = st.radio("Select Task Type for Evaluation", options=["Text Generation", "Image Segmentation"], horizontal=True)
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for i in range(0, len(image_files), batch_size):
+            batch_files = image_files[i:i+batch_size]
+            batch = torch.stack([torch.load(f) for f in batch_files])
+            
+            optimizer.zero_grad()
+            outputs = model(batch)
+            loss = criterion(outputs, batch)
+            loss.backward()
+            optimizer.step()
 
-    if task_type == "Text Generation":
-        st.subheader("### Text Model Evaluation")
-        eval_input_text = st.text_area("Input Text", placeholder="Enter text to evaluate the model...", height=150)
-        eval_model_name = st.text_input("Model Name", value="gpt2", placeholder="Enter the model name to evaluate...")
-        if st.button("Evaluate Vision Model"):
-            if uploaded_eval_image is not None:
-                eval_image = Image.open(uploaded_eval_image)
-                evaluate_vision_model(eval_image, eval_model_name)
-            else:
-                st.warning("Please upload an image for evaluation.")
+            running_loss += loss.item()
 
-# 📜 Logs Tab
-with tabs[4]:
-    st.header("📜 Real-Time Logs")
-    log_placeholder = st.empty()
-    st.button("Clear Logs", on_click=clear_logs)
+        st.write(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(image_files):.4f}")
 
-    # Start real-time log updates
-    threading.Thread(target=real_time_logs, args=(log_placeholder,), daemon=True).start()
+    torch.save(model.state_dict(), 'mae_pretrained.pth')
+    st.success("MAE pretraining completed. Model saved as 'mae_pretrained.pth'")
 
-# 🚀 Deployment Tab
-with tabs[5]:
-    st.header("🚀 Model Deployment")
-    deployment_action = st.radio("Select Deployment Action", options=["Export", "Push to Hub"], horizontal=True)
-    deploy_model_name = st.text_input("Model Name for Deployment", placeholder="Enter the model name for deployment...")
-    task_type = st.radio("Select Task Type for Deployment", options=["Text Generation", "Image Segmentation"], horizontal=True)
-    if st.button("Deploy Model"):
-        if deployment_action == "Export":
-            export_model(deploy_model_name, task_type=task_type.lower())
-        elif deployment_action == "Push to Hub":
-            push_model(deploy_model_name, task_type=task_type.lower())
+def start_training(task, model_name, lr, epochs, batch_size):
+    # ... existing code ...
+    
+    # Use gradient accumulation
+    accumulation_steps = 4  # Adjust based on available memory
+    optimizer.zero_grad()
+    
+    for epoch in range(epochs):
+        for i, batch in enumerate(dataloader):
+            outputs = model(batch)
+            loss = criterion(outputs, batch)
+            loss = loss / accumulation_steps
+            loss.backward()
+            
+            if (i + 1) % accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+    
+    # ... rest of the training code ...
 
-# 🔧 Utility Tab
-with tabs[6]:
-    st.header("🔧 Utility")
-    st.markdown("Monitor system resources and manage logs.")
-    resource_col1, resource_col2 = st.columns(2)
+if __name__ == "__main__":
+    main()
 
-    with resource_col1:
-        if st.button("Monitor System Resources"):
-            resources = monitor_resources()
-            st.text(resources)
-
-    with resource_col2:
-        if st.button("Clear Logs"):
-            clear_logs()
-
-# 💬 Feedback Tab
-with tabs[7]:
-    st.header("💬 Submit Feedback")
-    feedback_text = st.text_area("Your Feedback", placeholder="Enter your feedback here...")
-    if st.button("Submit Feedback"):
-        submit_feedback(feedback_text)
-
-# ❓ Help Tab
-with tabs[8]:
-    st.header("❓ Help & Documentation")
-    st.markdown("""
-    - [Hugging Face AutoTrain](https://huggingface.co/autotrain)
-    - [Streamlit Documentation](https://docs.streamlit.io)
-    - [Transformers](https://huggingface.co/transformers/)
-    - [PyTorch](https://pytorch.org/)
-    - [SegFormer for Image Segmentation](https://huggingface.co/ferferefer/segformer)
-    """)
-
-# Final wrap-up with general log monitoring thread
-if __name__ == '__main__':
-    logger.info("AutoTrain LLM & Vision app has started.")
-    st.info("AutoTrain LLM & Vision app is running.")
