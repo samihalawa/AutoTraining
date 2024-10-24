@@ -36,6 +36,7 @@ from torchvision import transforms
 from torch import nn
 from tenacity import retry, stop_after_attempt, wait_exponential
 from concurrent.futures import ThreadPoolExecutor
+import atexit
 
 # --------------------------- 2. Dependency Management ---------------------------
 def install_packages():
@@ -56,15 +57,18 @@ def install_packages():
 load_dotenv()
 
 # --------------------------- 4. Logging Configuration -----------------------------
-logger = logging.getLogger("LLM_Vision_AutoTrain")
-logger.setLevel(logging.DEBUG)
-Path("logs").mkdir(exist_ok=True)
-file_handler = logging.FileHandler("logs/autotrain_logs.txt", mode='a', encoding='utf-8')
-file_handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-log_queue = queue.Queue()
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# Use logger.info(), logger.warning(), logger.error() throughout the app
 
 # --------------------------- 5. Utility Functions ----------------------------------
 
@@ -678,28 +682,25 @@ def visualize_text_data(df):
     fig = px.histogram(word_counts, nbins=20, title="Word Count Distribution")
     st.plotly_chart(fig)
 
-def visualize_image_dataset(images_dir, masks_dir):
-    images = list(images_dir.glob('*'))[:5]
-    masks = list(masks_dir.glob('*'))[:5]
-    for img, mask in zip(images, masks):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(Image.open(img), caption=f"Image: {img.name}", use_column_width=True)
-        with col2:
-            st.image(Image.open(mask), caption=f"Mask: {mask.name}", use_column_width=True)
+def visualize_image_dataset(images):
+    cols = st.columns(5)
+    for idx, img in enumerate(images):
+        cols[idx % 5].image(img.permute(1, 2, 0).numpy(), use_column_width=True)
 
 # 3. Training Progress Visualization
 def visualize_training_progress(metrics):
-    fig = px.line(metrics, x="step", y="loss", title="Training Loss")
+    df = pd.DataFrame(metrics)
+    fig = px.line(df, x="epoch", y="loss", title="Training Loss")
     st.plotly_chart(fig)
 
 # 4. Model Comparison
-@st.cache(allow_output_mutation=True)
+@st.cache_data
 def compare_models(models, eval_data):
     results = []
-    for model in models:
+    for model_name in models:
+        model = load_model(model_name, "Text Generation")  # Adjust task as needed
         score = evaluate_model(model, eval_data)
-        results.append({"model": model, "score": score})
+        results.append({"model": model_name, "score": score})
     return pd.DataFrame(results)
 
 # 5. Hyperparameter Optimization
@@ -788,6 +789,11 @@ def create_mae_model():
             decoded = self.decoder(encoded)
             return decoded
 
+        def forward(self, x):
+            encoded = self.encoder(x)
+            decoded = self.decoder(encoded)
+            return decoded
+
     return MAE()
 
 # Main application code
@@ -810,7 +816,6 @@ def main():
     
     with tabs[4]:
         utilities()
-
 def data_management():
     st.header("Data Management")
     data_type = st.radio("Select Data Type", ["Text", "Image"])
@@ -830,8 +835,14 @@ def text_data_management():
 def image_data_management():
     uploaded_files = st.file_uploader("Upload Images or Zip File", type=["png", "jpg", "jpeg", "zip"], accept_multiple_files=True)
     if uploaded_files:
-        safe_execute(lambda: upload_image_data(uploaded_files), "Error uploading and preprocessing image data")
-        visualize_image_dataset(Path("data/images/images"), Path("data/images/masks"))
+        with st.spinner("Processing uploaded images..."):
+            processed_images = [mae_preprocess(Image.open(file)) for file in uploaded_files if file.type.startswith('image')]
+            if processed_images:
+                st.session_state['processed_images'] = processed_images
+                st.success(f"Processed {len(processed_images)} images.")
+                visualize_image_dataset(processed_images[:5])
+            else:
+                st.warning("No valid images found in the uploaded files.")
 
 def model_training():
     st.header("Model Training")
@@ -850,6 +861,17 @@ def model_training():
             epochs = st.number_input("Epochs", value=FINETUNING_PRESETS[preset]["epochs"])
             batch_size = st.number_input("Batch Size", value=FINETUNING_PRESETS[preset]["batch_size"])
         
+        if st.checkbox("Optimize Hyperparameters"):
+            with st.spinner("Optimizing hyperparameters..."):
+                best_config = optimize_hyperparameters(model, train_data, {
+                    "lr": tune.loguniform(1e-5, 1e-2),
+                    "batch_size": tune.choice([16, 32, 64]),
+                    "epochs": tune.choice([3, 5, 10])
+                })
+                st.success("Hyperparameter optimization complete.")
+                st.write("Best configuration:", best_config)
+                lr, batch_size, epochs = best_config["lr"], best_config["batch_size"], best_config["epochs"]
+        
         if st.button("Start Training"):
             safe_execute(lambda: start_training(task, model_name, lr, epochs, batch_size), "Error starting training")
 
@@ -866,6 +888,7 @@ def model_evaluation():
 
     if st.button("Compare Models"):
         models_to_compare = st.multiselect("Select models to compare", get_latest_models())
+        eval_data = load_eval_data()  # Implement this function to load evaluation data
         results_df = compare_models(models_to_compare, eval_data)
         st.write(results_df)
         st.plotly_chart(px.bar(results_df, x="model", y="score", title="Model Comparison"))
@@ -923,24 +946,70 @@ def start_mae_pretraining():
     st.success("MAE pretraining completed. Model saved as 'mae_pretrained.pth'")
 
 def start_training(task, model_name, lr, epochs, batch_size):
-    # ... existing code ...
+    model = load_model(model_name, task)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    criterion = get_criterion(task)
+    dataloader = get_dataloader(task, batch_size)
     
-    # Use gradient accumulation
-    accumulation_steps = 4  # Adjust based on available memory
-    optimizer.zero_grad()
+    progress_bar = st.progress(0)
+    status_text = st.empty()
     
     for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
         for i, batch in enumerate(dataloader):
-            outputs = model(batch)
-            loss = criterion(outputs, batch)
+            inputs, targets = process_batch(batch, task)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
             loss = loss / accumulation_steps
             loss.backward()
             
             if (i + 1) % accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
+            
+            running_loss += loss.item() * accumulation_steps
+            
+            progress = (epoch * len(dataloader) + i + 1) / (epochs * len(dataloader))
+            progress_bar.progress(progress)
+            status_text.text(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(dataloader)}")
+        
+        avg_loss = running_loss / len(dataloader)
+        st.session_state['training_progress'].append({"epoch": epoch+1, "loss": avg_loss})
+        visualize_training_progress(st.session_state['training_progress'])
     
-    # ... rest of the training code ...
+    save_model(model, f"{model_name}_finetuned")
+    st.success(f"Training completed. Model saved as '{model_name}_finetuned'")
+
+def validate_training_params(lr, epochs, batch_size):
+    if lr <= 0 or lr > 1:
+        st.error("Learning rate must be between 0 and 1.")
+        return False
+    if epochs <= 0 or epochs > 100:
+        st.error("Number of epochs must be between 1 and 100.")
+        return False
+    if batch_size <= 0 or batch_size > 512:
+        st.error("Batch size must be between 1 and 512.")
+        return False
+    return True
+
+# Use this function before starting training
+if validate_training_params(lr, epochs, batch_size):
+    start_training(task, model_name, lr, epochs, batch_size)
+
+def cleanup():
+    # Remove temporary files
+    for file in Path("temp").glob("*"):
+        file.unlink()
+    logger.info("Temporary files cleaned up.")
+
+atexit.register(cleanup)
+
+# Use temp directory for temporary files
+temp_dir = Path("temp")
+temp_dir.mkdir(exist_ok=True)
+
+# Use temp_dir when saving temporary files
 
 if __name__ == "__main__":
     main()
